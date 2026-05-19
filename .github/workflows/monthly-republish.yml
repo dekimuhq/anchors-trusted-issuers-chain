@@ -1,0 +1,36 @@
+name: Monthly republish
+
+# Re-signs the head of the trusted-issuers chain every 30 days even if no
+# governance change has occurred. Keeps freshness markers honest so consumers
+# (default verifier `valid_until` window) don't drift into staleness during
+# quiet months.
+#
+# DRY-RUN UNTIL PHASE B6. The script no-ops unless BOTH the
+# `REPUBLISH_ENABLED=1` and `SIGNING_KEY_BASE64` secrets are set. The
+# founder-ceremony in Phase B6 provisions those secrets.
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"  # 1st of each month, 00:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  republish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Run republish (dry-run unless REPUBLISH_ENABLED=1)
+        env:
+          REPUBLISH_ENABLED: ${{ secrets.REPUBLISH_ENABLED }}
+          SIGNING_KEY_BASE64: ${{ secrets.SIGNING_KEY_BASE64 }}
+        run: node scripts/republish.mjs
+      - name: Validate JCS round-trip
+        run: node scripts/test-canonical.mjs
