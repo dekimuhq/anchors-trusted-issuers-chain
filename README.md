@@ -39,10 +39,10 @@ chain/
   …
 .github/workflows/
   monthly-republish.yml                          ← re-sign head every 30d (Phase B4 — dry-run)
-  daily-monitor.yml                              ← poll each issuer's key-doc (Phase B5 — TBD)
+  daily-monitor.yml                              ← poll each issuer's key-doc (Phase B5)
 scripts/
   republish.mjs                                  ← invoked by monthly-republish.yml
-  monitor.mjs                                    ← invoked by daily-monitor.yml (Phase B5 — TBD)
+  monitor.mjs                                    ← invoked by daily-monitor.yml
   lib/canonical.mjs                              ← RFC 8785-lite JCS — byte-equal mirror of @dekimuhq/anchors-envelope
   test-canonical.mjs                             ← hand-rolled JCS round-trip sanity check
 SECURITY.md
@@ -156,8 +156,8 @@ then every scheduled run is a no-op.
 
 ## Daily monitor cron
 
-`daily-monitor.yml` runs every day at 06:00 UTC (Phase B5 — to be added). For
-each issuer in the head list:
+`daily-monitor.yml` runs every day at 06:00 UTC. For each issuer in the head
+list:
 
 1. Fetch `https://<domain>/.well-known/dekimu-keys.json`.
 2. (Optional) fetch `https://<domain>/.well-known/dekimu-issuer.json` manifest

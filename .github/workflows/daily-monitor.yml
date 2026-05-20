@@ -1,0 +1,70 @@
+name: Daily issuer monitor
+
+# Probes every active trusted-issuer's .well-known/dekimu-keys.json daily.
+# After FAILURE_THRESHOLD (3) consecutive failures, opens a draft PR proposing
+# the issuer's revocation (revoked_at: <now>, reason "domain_unreachable").
+# The founder reviews and merges manually; the monthly republish cron re-signs
+# the head once the proposed list lands on main.
+#
+# Until Phase B6 commits the genesis list, chain/ is empty and the monitor
+# is a no-op. Workflow stays scheduled so freshness markers are visible from
+# day one.
+#
+# Per master plan section 2.5 + Q6 + Phase B5 plan.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"  # 06:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Run monitor
+        id: monitor
+        run: node scripts/monitor.mjs
+
+      - name: Commit refreshed counters
+        if: steps.monitor.outputs.proposed != 'true'
+        run: |
+          if git diff --quiet .github/state/monitor.json 2>/dev/null; then
+            echo "no counter changes — nothing to commit"
+            exit 0
+          fi
+          git config user.name "dekimu-bot"
+          git config user.email "ops@dekimu.com"
+          git add .github/state/monitor.json
+          git commit -m "monitor: refresh issuer counters ($(date -u +%Y-%m-%d))"
+          git push origin main
+
+      - name: Open draft revocation PR
+        if: steps.monitor.outputs.proposed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.monitor.outputs.branch }}
+          ISS: ${{ steps.monitor.outputs.iss }}
+          COUNT: ${{ steps.monitor.outputs.count }}
+          FILE: ${{ steps.monitor.outputs.file }}
+        run: |
+          DOMAIN="${ISS#did:web:}"
+          git config user.name "dekimu-bot"
+          git config user.email "ops@dekimu.com"
+          git checkout -b "$BRANCH"
+          git add chain/ .github/state/monitor.json
+          PR_TITLE="revocation: ${ISS} — ${COUNT} consecutive key-doc failures"
+          PR_BODY="Automated proposal from daily-monitor cron. Domain ${DOMAIN} failed ${COUNT} consecutive daily probes of /.well-known/dekimu-keys.json. Per master plan section 2.5 + Q6, the monitor wrote the next-version chain file with revoked_at populated and sig: null. Founder review required before merge; the next monthly republish cron will re-sign the head."
+          git commit -m "$PR_TITLE" -m "$PR_BODY" -m "regression check: grep -n revoked_at chain/${FILE}"
+          git push origin "$BRANCH"
+          gh pr create --draft --base main --head "$BRANCH" --title "$PR_TITLE" --body "$PR_BODY"
