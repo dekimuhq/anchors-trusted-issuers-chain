@@ -1,0 +1,23 @@
+{
+  "kind": "ar.trusted_issuers.v1",
+  "version": 2,
+  "issued_at": "2026-07-21T08:16:20.223Z",
+  "valid_until": "2026-08-20T08:16:20.223Z",
+  "publisher": "did:web:dekimu.com",
+  "publisher_key": "ed25519:1xTV4r0WgqzcrRy-A-JPJBdQPleWUReSxfRO9x9Yifk",
+  "previous_sha256": null,
+  "issuers": [
+    {
+      "iss": "did:web:dekimu.com:autonomy",
+      "added_at": "2026-07-17T14:40:05.025Z",
+      "revoked_at": "2026-07-21T08:16:20.223Z",
+      "families": [
+        "action"
+      ],
+      "profiles_pinned": null,
+      "notes": "Dekimu autonomy agent (GitHub Actions CI lanes) — mints ar.action.v1 receipts under kid autonomy-2026-07, pubkey ed25519:Gor-OBUqsaQ2_7dmEMXXQHPTtgdYm25kHFSnW42t5_I. Contact: hello@dekimu.com.",
+      "revocation_reason": "domain_unreachable"
+    }
+  ],
+  "sig": null
+}
