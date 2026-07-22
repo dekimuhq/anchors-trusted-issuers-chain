@@ -49,8 +49,30 @@ jobs:
           git commit -m "monitor: refresh issuer counters ($(date -u +%Y-%m-%d))"
           git push origin main
 
-      - name: Open draft revocation PR
+      # The counter keeps climbing past the threshold, so every day after the
+      # first proposal re-proposed the same revocation on a new date-stamped
+      # branch: PRs #2/#3/#4 for did:web:dekimu.com:autonomy on three
+      # consecutive days. One open proposal per issuer is enough — a second
+      # one adds no information and buries the first.
+      - name: Skip if a revocation PR for this issuer is already open
+        id: dupe
         if: steps.monitor.outputs.proposed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISS: ${{ steps.monitor.outputs.iss }}
+        run: |
+          set -euo pipefail
+          EXISTING=$(gh pr list --state open --json title \
+            --jq '[.[] | select(.title | startswith("revocation: " + env.ISS + " "))] | length')
+          if [ "$EXISTING" != "0" ]; then
+            echo "::notice::${EXISTING} open revocation PR(s) already exist for ${ISS} — not opening another."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open draft revocation PR
+        if: steps.monitor.outputs.proposed == 'true' && steps.dupe.outputs.skip == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ steps.monitor.outputs.branch }}

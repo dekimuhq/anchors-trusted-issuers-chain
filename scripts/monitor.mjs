@@ -28,8 +28,10 @@
  *   1. Read latest chain file under `chain/`. Empty → exit 0.
  *   2. Load state from `.github/state/monitor.json`. Missing → empty map.
  *   3. For each issuer where `revoked_at === null`:
- *      a. Fetch `https://<domain>/.well-known/dekimu-keys.json` (required).
- *      b. Fetch `https://<domain>/.well-known/dekimu-issuer.json` (optional).
+ *      a. Fetch `<did:web base>/.well-known/dekimu-keys.json` (required).
+ *      b. Fetch `<did:web base>/.well-known/dekimu-issuer.json` (optional).
+ *      The base is derived exactly as `@dekimuhq/did-web-resolver` derives it,
+ *      including path segments — see `baseUrlOf()`.
  *      c. (a) ok → reset counter to 0. (a) fail → increment counter.
  *   4. Persist state to `.github/state/monitor.json`.
  *   5. For any issuer with counter ≥ FAILURE_THRESHOLD: write proposed
@@ -41,6 +43,7 @@ import { readdir, readFile, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalize } from "./lib/canonical.mjs";
+import { baseUrlOf, issuerSlug } from "./lib/did-web.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -62,16 +65,9 @@ function todayUtcIsoDate() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function domainOf(iss) {
-  if (!iss.startsWith("did:web:")) {
-    throw new Error(`unsupported iss scheme: ${iss} (only did:web supported)`);
-  }
-  return iss.slice("did:web:".length).split(":")[0];
-}
-
-function issuerSlug(iss) {
-  return domainOf(iss).replace(/[^a-z0-9.-]/gi, "_");
-}
+// baseUrlOf / issuerSlug live in ./lib/did-web.mjs so scripts/test-did-web.mjs
+// can pin them against the resolver's vectors without importing this module
+// (which runs main() on import).
 
 async function listChainFiles() {
   let entries;
@@ -154,10 +150,12 @@ async function main() {
   const proposedRevocations = [];
   for (const row of headDoc.issuers) {
     if (row.revoked_at !== null) continue;
-    const domain = domainOf(row.iss);
-    const keyRes = await probe(`https://${domain}${KEY_DOC_PATH}`);
-    const manRes = await probe(`https://${domain}${MANIFEST_PATH}`);
-    log(`${row.iss} key=${keyRes.status} manifest=${manRes.status}`);
+    const base = baseUrlOf(row.iss);
+    const keyRes = await probe(`${base}${KEY_DOC_PATH}`);
+    const manRes = await probe(`${base}${MANIFEST_PATH}`);
+    // Log the URL, not just the status: the 2026-07-20 cascade was a
+    // wrong-URL bug, and "key=404" alone gave no way to see that.
+    log(`${row.iss} key=${keyRes.status} manifest=${manRes.status} (base: ${base})`);
     const prev = Number(state.counters[row.iss] ?? 0);
     if (keyRes.ok) {
       state.counters[row.iss] = 0;
