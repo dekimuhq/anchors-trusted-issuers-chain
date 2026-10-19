@@ -34,17 +34,19 @@ chain from genesis to detect tampering at any link.
 
 ```
 chain/
+  head.json                                      ← copy of the newest signed doc (served by verify.dekimu.com)
   dekimu-trusted-issuers.v01.<issued_at>.json    ← genesis (Phase B6)
   dekimu-trusted-issuers.v02.<issued_at>.json
   …
 .github/workflows/
-  monthly-republish.yml                          ← re-sign head every 30d (Phase B4 — dry-run)
+  monthly-republish.yml                          ← weekly: re-sign head when < 14d validity left → PR
   daily-monitor.yml                              ← poll each issuer's key-doc (Phase B5)
 scripts/
   republish.mjs                                  ← invoked by monthly-republish.yml
   monitor.mjs                                    ← invoked by daily-monitor.yml
   lib/canonical.mjs                              ← RFC 8785-lite JCS — byte-equal mirror of @dekimuhq/anchors-envelope
   test-canonical.mjs                             ← hand-rolled JCS round-trip sanity check
+  test-republish.mjs                             ← planner/signer checks + committed-chain verification
 SECURITY.md
 LICENSE                                          ← Apache-2.0
 README.md
@@ -137,20 +139,32 @@ issuers. Higher scale requires the federation council (Phase C).
 
 ## Auto-republish cron
 
-`monthly-republish.yml` runs on the 1st of each month at 00:00 UTC. The
-underlying `scripts/republish.mjs` script:
+`monthly-republish.yml` (name kept for history) runs **weekly**, Mondays
+03:17 UTC, plus `workflow_dispatch`. `scripts/republish.mjs`:
 
-- Reads the highest-versioned file under `chain/`.
-- If `now() - issued_at < 30 days` → exits 0 (head still fresh).
-- Otherwise builds `v<N+1>` with the same issuers, new `issued_at` /
-  `valid_until`, bumped version, and `previous_sha256` linking back.
-- **In dry-run mode (default)**: prints what it would do; exits 0.
-- **In production mode** (`REPUBLISH_ENABLED=1` + `SIGNING_KEY_BASE64` set):
-  signs, writes the new file, commits + pushes, triggers
-  `verify.dekimu.com` rebuild.
+- Finds the head (highest `vNN`) and the newest doc whose `sig` verifies.
+- Head unsigned or edited without re-signing (a merged monitor revocation or
+  issuer-addition PR) → signs it as `v<last signed + 1>`, chained to the last
+  signed doc, and removes the proposal file.
+- Head signed with **≥ 14 days** of validity left → exits 0.
+- Otherwise builds `v<N+1>`: same issuers, `issued_at` = now,
+  `valid_until` = now + 30 days, `previous_sha256` linking back.
+- Refuses a `SIGNING_KEY_BASE64` whose public key is not the doc's
+  `publisher_key` (rotation is a founder ceremony, never a cron).
+- Writes the new file **and `chain/head.json`** (byte copy of the newest
+  signed doc), self-verifies, and the workflow opens a `republish/vNN` PR.
+  Merging it is the publish gate.
+- Renewal due but no signing key, or the `REPUBLISH_DISABLED=1` repo-variable
+  kill switch → exits 2 (red), never a silent dry-run.
 
-The two secrets are provisioned in the **Phase B6 founder ceremony**. Until
-then every scheduled run is a no-op.
+`verify.dekimu.com/.well-known/dekimu-trusted-issuers.json` serves
+`chain/head.json` from `main` (1 h cache), so a merged republish is live within
+the hour without a verify redeploy.
+
+History: until 2026-10-19 the job ran on the 1st of the month, skipped heads
+younger than 30 days (with a 30-day validity — so a mid-month doc always sat
+expired for weeks) and stayed dry-run because `REPUBLISH_ENABLED` was never
+provisioned. v01 expired 2026-08-16 behind four green runs.
 
 ---
 

@@ -1,157 +1,209 @@
 #!/usr/bin/env node
 /**
- * Monthly republish of the head trusted-issuers list.
+ * Re-sign the head of the trusted-issuers chain before it expires.
  *
- * Invoked by `.github/workflows/monthly-republish.yml`.
+ * Invoked by `.github/workflows/monthly-republish.yml` (weekly check). The
+ * workflow — not this script — branches, commits and opens the PR.
  *
- * Dry-run is the default. The script ONLY mutates the working tree when both
- * of these are true:
- *   - `REPUBLISH_ENABLED=1` env var is set (gates accidental cron firings)
- *   - `SIGNING_KEY_BASE64` env var holds a 32-byte raw Ed25519 private key
+ * Why weekly + a renewal margin (2026-10-19): the old monthly cron skipped a
+ * head younger than 30 days while every doc is only valid for 30 days, so a
+ * doc issued mid-month was guaranteed to sit expired for up to a month. v01
+ * (issued 2026-07-17, valid_until 2026-08-16) expired that way — and then the
+ * job stayed dry-run because `REPUBLISH_ENABLED` was never provisioned at the
+ * B6 ceremony, printing a green "would build v02" every month.
  *
- * Neither is set until Phase B6 (founder ceremony — real bootstrap key). Until
- * then the workflow runs every month and prints what it would do without
- * touching the repo.
+ * Logic:
+ *   1. Read every `chain/dekimu-trusted-issuers.vNN.*.json`.
+ *   2. `lastSigned` = highest-version doc whose `sig` verifies under its own
+ *      `publisher_key`. `head` = highest-version doc overall.
+ *   3. head unsigned / sig invalid → it is a merged governance proposal (the
+ *      daily monitor writes revocations with `sig: null`; issuer additions are
+ *      PR edits). Sign it as `lastSigned.version + 1`, chained to `lastSigned`,
+ *      and delete the proposal file.
+ *   4. head signed and `valid_until - now >= RENEW_MARGIN_MS` → fresh, exit 0.
+ *   5. Otherwise build `head.version + 1` with a fresh 30-day window.
+ *   6. Signing key = `SIGNING_KEY_BASE64` (raw 32-byte Ed25519 seed). Its
+ *      public key MUST equal the doc's `publisher_key`, else refuse.
+ *   7. Write the new file + `chain/head.json` (byte copy of the newest signed
+ *      doc — the stable path verify.dekimu.com fetches), print
+ *      `wrote=<filename>` to $GITHUB_OUTPUT.
  *
- * Logic (per master plan §2.5 + Phase B4 plan):
- *   1. Read latest chain file (highest version) under `chain/`.
- *   2. If no chain file exists → exit 0 with "chain empty, nothing to republish"
- *      (initial state until B6 commits the genesis list).
- *   3. If `now() - issued_at < 30 days` → exit 0 with "head is fresh".
- *   4. Otherwise build the next-version doc:
- *        - same `kind`, `publisher`, `publisher_key`, `issuers`
- *        - `version` += 1
- *        - `issued_at` = now, `valid_until` = now + 30d
- *        - `previous_sha256` = `sha256:` + sha256(canonical(prev)) over SIGNED bytes
- *      Sign with the publisher key (read from `SIGNING_KEY_BASE64`), set
- *      `sig` to the base64url-encoded signature.
- *   5. If dry-run → print the new doc to stdout; exit 0.
- *   6. Otherwise write `chain/dekimu-trusted-issuers.v<NN>.<issued_at>.json`,
- *      git commit + push, then trigger the verify.dekimu.com rebuild workflow.
+ * Exit codes: 0 = fresh or wrote a doc · 1 = error · 2 = a renewal was due but
+ * could not be produced (no key / kill switch) — red on purpose, because a
+ * silent dry-run is exactly how v01 expired unnoticed.
  *
- * The `verify.dekimu.com` rebuild hook is a forward-reference; this script
- * prints the trigger command but does not execute it until B6.
+ * Kill switch: `REPUBLISH_DISABLED=1` (repo variable) → no write, exit 2 when
+ * a renewal was due.
  */
 
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile, writeFile, unlink, appendFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { canonicalize } from "./lib/canonical.mjs";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const REPO_ROOT = path.resolve(__dirname, "..");
-const CHAIN_DIR = path.join(REPO_ROOT, "chain");
-const REPUBLISH_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000;
-const RFC8032_RAW_PRIVATE_BYTES = 32;
+export const VALIDITY_MS = 30 * 24 * 60 * 60 * 1000;
+export const RENEW_MARGIN_MS = 14 * 24 * 60 * 60 * 1000;
+const FILE_RE = /^dekimu-trusted-issuers\.v(\d+)\..+\.json$/;
+const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
+const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 
 function log(msg) {
   process.stdout.write(`[republish] ${msg}\n`);
 }
 
-async function listChainFiles() {
-  let entries;
-  try {
-    entries = await readdir(CHAIN_DIR);
-  } catch (err) {
-    if (err && err.code === "ENOENT") return [];
-    throw err;
-  }
-  return entries
-    .filter((f) => /^dekimu-trusted-issuers\.v\d+\..+\.json$/.test(f))
-    .sort();
-}
-
-function versionOf(filename) {
-  const m = filename.match(/^dekimu-trusted-issuers\.v(\d+)\./);
-  return m ? Number.parseInt(m[1], 10) : -1;
-}
-
-function base64UrlEncode(bytes) {
+export function base64UrlEncode(bytes) {
   return Buffer.from(bytes).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function sha256OfCanonical(doc) {
-  const canonical = canonicalize(doc);
-  const h = crypto.createHash("sha256");
-  h.update(canonical);
-  return `sha256:${h.digest("hex")}`;
+export function sha256OfCanonical(doc) {
+  return `sha256:${crypto.createHash("sha256").update(canonicalize(doc)).digest("hex")}`;
 }
 
-function loadSigningKeyOrNull() {
-  const b64 = process.env.SIGNING_KEY_BASE64;
-  if (!b64) return null;
+export function signerFromSeedB64(b64) {
   const raw = Buffer.from(b64, "base64");
-  if (raw.length !== RFC8032_RAW_PRIVATE_BYTES) {
-    throw new Error(
-      `SIGNING_KEY_BASE64 decodes to ${raw.length} bytes; expected ${RFC8032_RAW_PRIVATE_BYTES} for raw Ed25519 private key`,
-    );
+  if (raw.length !== 32) {
+    throw new Error(`SIGNING_KEY_BASE64 decodes to ${raw.length} bytes; expected 32 (raw Ed25519 seed)`);
   }
-  // Wrap as PKCS8 for Node's `crypto.createPrivateKey`.
-  // Ed25519 PKCS8 prefix per RFC 8410.
-  const pkcs8Prefix = Buffer.from("302e020100300506032b657004220420", "hex");
-  const pkcs8 = Buffer.concat([pkcs8Prefix, raw]);
-  return crypto.createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+  return crypto.createPrivateKey({ key: Buffer.concat([PKCS8_ED25519_PREFIX, raw]), format: "der", type: "pkcs8" });
+}
+
+export function publisherKeyOf(privateKey) {
+  const spki = crypto.createPublicKey(privateKey).export({ format: "der", type: "spki" });
+  return `ed25519:${base64UrlEncode(spki.subarray(spki.length - 32))}`;
+}
+
+/** True iff `doc.sig` verifies over JCS({...doc, sig:null}) under `doc.publisher_key`. */
+export function sigValid(doc) {
+  if (typeof doc?.sig !== "string" || typeof doc?.publisher_key !== "string") return false;
+  if (!doc.publisher_key.startsWith("ed25519:")) return false;
+  try {
+    const raw = Buffer.from(doc.publisher_key.slice("ed25519:".length), "base64url");
+    if (raw.length !== 32) return false;
+    const pub = crypto.createPublicKey({ key: Buffer.concat([SPKI_ED25519_PREFIX, raw]), format: "der", type: "spki" });
+    return crypto.verify(null, Buffer.from(canonicalize({ ...doc, sig: null })), pub, Buffer.from(doc.sig, "base64url"));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pure planner. `entries` = [{ file, doc }] sorted by version ascending.
+ * Returns { action: "none"|"empty"|"renew"|"sign-proposal", base?, prev?, proposalFile?, reason }.
+ */
+export function plan(entries, now) {
+  if (entries.length === 0) return { action: "empty", reason: "chain/ is empty" };
+  const head = entries.at(-1);
+  const lastSigned = [...entries].reverse().find((e) => sigValid(e.doc)) ?? null;
+  if (!sigValid(head.doc)) {
+    if (lastSigned === null) return { action: "error", reason: "no validly signed doc in chain/ to chain a proposal onto" };
+    return {
+      action: "sign-proposal",
+      base: head.doc,
+      prev: lastSigned.doc,
+      proposalFile: head.file,
+      reason: `head ${head.file} is unsigned or its sig does not verify — signing it as v${lastSigned.doc.version + 1}`,
+    };
+  }
+  const remainingMs = Date.parse(head.doc.valid_until) - now.getTime();
+  if (remainingMs >= RENEW_MARGIN_MS) {
+    return { action: "none", reason: `head v${head.doc.version} valid for ${(remainingMs / 86400000).toFixed(1)} more days` };
+  }
+  return {
+    action: "renew",
+    base: head.doc,
+    prev: head.doc,
+    reason: remainingMs < 0
+      ? `head v${head.doc.version} EXPIRED ${(-remainingMs / 86400000).toFixed(1)} days ago`
+      : `head v${head.doc.version} expires in ${(remainingMs / 86400000).toFixed(1)} days (< ${RENEW_MARGIN_MS / 86400000}d margin)`,
+  };
+}
+
+/** Build + sign the next doc. `prev` is the signed predecessor it chains onto. */
+export function buildNext({ base, prev, now, privateKey }) {
+  const signerKey = publisherKeyOf(privateKey);
+  if (signerKey !== prev.publisher_key || signerKey !== base.publisher_key) {
+    throw new Error(`signing key ${signerKey} does not match publisher_key ${prev.publisher_key} — refusing (key rotation is a founder ceremony)`);
+  }
+  const unsigned = {
+    ...base,
+    version: prev.version + 1,
+    issued_at: now.toISOString(),
+    valid_until: new Date(now.getTime() + VALIDITY_MS).toISOString(),
+    previous_sha256: sha256OfCanonical(prev),
+    sig: null,
+  };
+  const sig = crypto.sign(null, Buffer.from(canonicalize(unsigned)), privateKey);
+  const signed = { ...unsigned, sig: base64UrlEncode(sig) };
+  if (!sigValid(signed)) throw new Error("self-verify of the new doc failed");
+  return signed;
+}
+
+export function fileNameFor(doc) {
+  return `dekimu-trusted-issuers.v${String(doc.version).padStart(2, "0")}.${doc.issued_at}.json`;
+}
+
+export async function loadChain(chainDir) {
+  let names;
+  try {
+    names = await readdir(chainDir);
+  } catch (err) {
+    if (err?.code === "ENOENT") return [];
+    throw err;
+  }
+  const entries = [];
+  for (const file of names) {
+    const m = file.match(FILE_RE);
+    if (!m) continue;
+    entries.push({ file, version: Number.parseInt(m[1], 10), doc: JSON.parse(await readFile(path.join(chainDir, file), "utf8")) });
+  }
+  return entries.sort((a, b) => a.version - b.version);
 }
 
 async function main() {
-  const dryRun = process.env.REPUBLISH_ENABLED !== "1";
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const chainDir = path.join(repoRoot, "chain");
   const now = new Date();
-
-  log(`dry-run: ${dryRun}`);
   log(`now: ${now.toISOString()}`);
 
-  const files = await listChainFiles();
-  if (files.length === 0) {
-    log("chain/ is empty — nothing to republish (genesis list ships in Phase B6)");
-    return 0;
+  const entries = await loadChain(chainDir);
+  const p = plan(entries, now);
+  log(p.reason);
+  if (p.action === "empty" || p.action === "none") return 0;
+  if (p.action === "error") {
+    process.stderr.write(`[republish] ERROR: ${p.reason}\n`);
+    return 1;
   }
 
-  const head = files.sort((a, b) => versionOf(a) - versionOf(b)).at(-1);
-  log(`head: ${head}`);
-  const headDoc = JSON.parse(await readFile(path.join(CHAIN_DIR, head), "utf8"));
-
-  const issuedAtMs = Date.parse(headDoc.issued_at);
-  const ageMs = now.getTime() - issuedAtMs;
-  log(`head age: ${(ageMs / 1000 / 60 / 60 / 24).toFixed(1)} days`);
-  if (ageMs < REPUBLISH_INTERVAL_MS) {
-    log("head is fresh (< 30d) — skipping republish");
-    return 0;
+  if (process.env.REPUBLISH_DISABLED === "1") {
+    process.stdout.write(`::error::renewal due (${p.reason}) but REPUBLISH_DISABLED=1 — chain head will expire\n`);
+    return 2;
+  }
+  const b64 = process.env.SIGNING_KEY_BASE64;
+  if (!b64) {
+    process.stdout.write(`::error::renewal due (${p.reason}) but SIGNING_KEY_BASE64 is not available to this run\n`);
+    return 2;
   }
 
-  const signingKey = loadSigningKeyOrNull();
-  if (dryRun || !signingKey) {
-    log(`would build v${headDoc.version + 1} signed by publisher key ${headDoc.publisher_key}`);
-    log("dry-run / no signing key — exiting without writing");
-    return 0;
+  const next = buildNext({ base: p.base, prev: p.prev, now, privateKey: signerFromSeedB64(b64) });
+  const nextFile = fileNameFor(next);
+  const body = JSON.stringify(next, null, 2) + "\n";
+  await writeFile(path.join(chainDir, nextFile), body);
+  await writeFile(path.join(chainDir, "head.json"), body);
+  if (p.action === "sign-proposal") await unlink(path.join(chainDir, p.proposalFile));
+  log(`wrote ${nextFile} (previous_sha256 ${next.previous_sha256}) + head.json`);
+  if (process.env.GITHUB_OUTPUT) {
+    await appendFile(process.env.GITHUB_OUTPUT, `wrote=${nextFile}\nversion=${next.version}\n`);
   }
-
-  const validUntilMs = now.getTime() + REPUBLISH_INTERVAL_MS;
-  const nextUnsigned = {
-    ...headDoc,
-    version: headDoc.version + 1,
-    issued_at: now.toISOString(),
-    valid_until: new Date(validUntilMs).toISOString(),
-    previous_sha256: sha256OfCanonical(headDoc),
-    sig: null,
-  };
-
-  const sig = crypto.sign(null, Buffer.from(canonicalize(nextUnsigned)), signingKey);
-  const nextSigned = { ...nextUnsigned, sig: base64UrlEncode(sig) };
-
-  const nextFilename = `dekimu-trusted-issuers.v${String(nextSigned.version).padStart(2, "0")}.${nextSigned.issued_at}.json`;
-  const nextPath = path.join(CHAIN_DIR, nextFilename);
-  await writeFile(nextPath, JSON.stringify(nextSigned, null, 2) + "\n");
-  log(`wrote ${nextFilename}`);
-  log("next steps (gated on B6): git add + commit + push, then trigger verify.dekimu.com rebuild");
   return 0;
 }
 
-main().then(
-  (code) => process.exit(code),
-  (err) => {
-    process.stderr.write(`[republish] ERROR: ${err?.message ?? err}\n`);
-    process.exit(1);
-  },
-);
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().then(
+    (code) => process.exit(code),
+    (err) => {
+      process.stderr.write(`[republish] ERROR: ${err?.message ?? err}\n`);
+      process.exit(1);
+    },
+  );
+}
