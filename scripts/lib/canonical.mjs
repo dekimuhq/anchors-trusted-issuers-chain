@@ -3,11 +3,11 @@
  *
  * Standalone copy for the anchors-trusted-issuers-chain repo. Mirrors
  * `@dekimuhq/anchors-envelope/src/canonicalize.ts` byte-for-byte. This repo
- * must not depend on the monorepo at runtime (per Phase B4 plan, master plan
+ * must not depend on the reference implementation at runtime (per Phase B4 plan, master plan
  * §2.5 — the chain repo is a passive mirror, fully self-contained).
  *
  * If you change this file, update `anchors/envelope/src/canonicalize.ts` in
- * the dekimuhq/dekimu monorepo first and prove byte-equality with a round-trip
+ * the reference implementation first and prove byte-equality with a round-trip
  * fixture before mirroring the change here.
  *
  * Rules:

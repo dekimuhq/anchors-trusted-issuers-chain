@@ -4,7 +4,7 @@
  * GENESIS `ar.trusted_issuers.v1` list.
  *
  * Prepared 2026-07-16 for the autonomy-receipts go-live (checklist item 4,
- * knowledge/autonomy-tiers.md § Automation batch in the dekimu monorepo):
+ * knowledge/autonomy-tiers.md § Automation batch in the reference implementation):
  * the genesis list admits `did:web:dekimu.com:autonomy` with
  * `families: ["action"]` so autonomy CI receipts (kid `autonomy-2026-07`)
  * stop rendering untrusted.
@@ -169,7 +169,7 @@ async function main() {
   log(`bootstrap publisher public key: ed25519:${pubB64u}`);
   log("follow-ups (in order):");
   log(`  1. git add chain/${filename} && git commit -m 'feat(chain): genesis v01 — autonomy issuer (families: action)' && git push`);
-  log("  2. anchors monorepo: set BOOTSTRAP_PUBLISHER_KEY in trusted-issuers/src/bootstrap.ts to the pubkey above (MAJOR bump per governance)");
+  log("  2. reference implementation: set BOOTSTRAP_PUBLISHER_KEY in trusted-issuers/src/bootstrap.ts to the pubkey above (MAJOR bump per governance)");
   log("  3. verify.dekimu.com: add autonomy kid to CLAIMS_VERIFY_KEYS_JSON to flip valid_untrusted → valid_trusted:");
   log('     "autonomy-2026-07": { "issuer": "did:web:dekimu.com:autonomy", "publicKey": "Gor-OBUqsaQ2_7dmEMXXQHPTtgdYm25kHFSnW42t5_I" }');
   log("  4. optional: enable the monthly republish (gh secret set REPUBLISH_ENABLED -R " + CHAIN_REPO + " --body 1)");

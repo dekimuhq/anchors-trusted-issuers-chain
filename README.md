@@ -17,7 +17,7 @@ The Anchored Receipts protocol family (APR, ACR, ARR, ALR, ANR, ASR, ABR, AIR,
 and friends) uses a single shared allowlist of "trusted issuers" — DIDs whose
 receipts a verifier is willing to surface as `valid_trusted` instead of
 `valid_untrusted`. The wire-format of the allowlist is
-[`ar.trusted_issuers.v1`](https://github.com/dekimuhq/dekimu/blob/main/anchors/meta/FAMILY-CONSISTENCY.md)
+[`ar.trusted_issuers.v1`](https://github.com/dekimuhq/anchors-spec/blob/main/family-consistency.md)
 — a standalone signed JSON document, sibling-shape to `ar.continuity.v1`,
 **not** wrapped in the v=2 envelope.
 
@@ -174,7 +174,7 @@ The monitor cannot revoke unilaterally — it can only nominate.
 
 ## Single-org allowlist for v1
 
-v1 of this allowlist is single-org-curated by Dekimu Labs SL. There is no
+v1 of this allowlist is single-org-curated by Dekimu. There is no
 multi-party council, no on-chain voting, no automated admission. The
 governance table above is the entire policy surface. This is intentional:
 
@@ -185,11 +185,15 @@ governance table above is the entire policy surface. This is intentional:
   council-curated list as a SEPARATE `ar.trusted_issuers_council.v1` doc,
   leaving the v1 doc as the conservative single-org fallback.
 
-Defer questions about multi-party governance to the [cross-issuer interop
-master plan](https://github.com/dekimuhq/dekimu).
+Multi-party governance is deferred to the cross-issuer interop
+master plan (Phase C); it is not yet published.
 
 ---
 
 ## License
 
 Apache 2.0 — see [`LICENSE`](LICENSE).
+
+## Part of the Dekimu ecosystem
+
+Built and maintained by [Dekimu](https://dekimu.com). The Dekimu ecosystem — [Dekimu Hub](https://app.dekimu.com) and the public verifier at [verify.dekimu.com](https://verify.dekimu.com) — is the reference implementation for this project. Sibling projects: [anchors-spec](https://github.com/dekimuhq/anchors-spec) · [dekimu-mcp](https://github.com/dekimuhq/dekimu-mcp) · [agents.txt](https://github.com/dekimuhq/agents-txt) · [regulation-as-code](https://github.com/dekimuhq/regulation-as-code) · [claude-memory](https://github.com/dekimuhq/claude-memory). All of them: https://dekimu.com/open-source.
