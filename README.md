@@ -34,17 +34,19 @@ chain from genesis to detect tampering at any link.
 
 ```
 chain/
+  head.json                                      ← copy of the newest signed doc (served by verify.dekimu.com)
   dekimu-trusted-issuers.v01.<issued_at>.json    ← genesis (Phase B6)
   dekimu-trusted-issuers.v02.<issued_at>.json
   …
 .github/workflows/
-  monthly-republish.yml                          ← re-sign head every 30d (Phase B4 — dry-run)
+  monthly-republish.yml                          ← weekly: re-sign head when < 14d validity left → PR
   daily-monitor.yml                              ← poll each issuer's key-doc (Phase B5)
 scripts/
   republish.mjs                                  ← invoked by monthly-republish.yml
   monitor.mjs                                    ← invoked by daily-monitor.yml
   lib/canonical.mjs                              ← RFC 8785-lite JCS — byte-equal mirror of @dekimuhq/anchors-envelope
   test-canonical.mjs                             ← hand-rolled JCS round-trip sanity check
+  test-republish.mjs                             ← planner/signer checks + committed-chain verification
 SECURITY.md
 LICENSE                                          ← Apache-2.0
 README.md
@@ -61,8 +63,8 @@ trust" on empty input.
 
 | Action | Approver(s) | Mechanism |
 |---|---|---|
-| Add a new trusted issuer | Founder + 1 maintainer | PR on this repo signed by both; merged manually after `daily-monitor` confirms the issuer's `/.well-known/dekimu-keys.json` resolves. |
-| Revoke an issuer | Founder (sole, fast-path) | PR sets `revoked_at` on the issuer record; merged on same day. Bypass approval gate is intentional — revocation is always safe and time-critical. |
+| Add a new trusted issuer | Founder + 1 maintainer | PR on this repo adds the record to an **unsigned** next-version file, merged after `daily-monitor` confirms the issuer's `/.well-known/dekimu-keys.json` resolves. **The merge changes nothing that verifiers trust.** The trust change happens only when the founder dispatches `monthly-republish.yml` with `proposal_sha256` = the committed file's sha256 (see below). |
+| Revoke an issuer | Founder (sole, fast-path) | PR (or the monitor's draft PR) sets `revoked_at` in an unsigned next-version file, merged the same day. The revocation becomes effective at the founder's `proposal_sha256` dispatch, which can follow the merge immediately. |
 | Rotate the publisher key | Founder ceremony | New publisher key signs `v<N+1>` with the old `publisher_key` carried in `previous_publisher_key` (additive field, future-tracked). 90-day overlap window. MAJOR version bump on `@dekimuhq/anchors-trusted-issuers`. Cadence: 1 year. |
 | Federation council vote | (Future) | v1 ships single-org allowlist. Federation handshake is Phase C of the cross-issuer interop master plan — not in scope here. |
 
@@ -127,7 +129,7 @@ federation handshake, additions are PR-driven on this repo. Steps:
    - `notes`: 1–2 sentences explaining what your org does and how to reach you
 3. The maintainer team will run the daily monitor against your domain. After
    3 consecutive clean polls, the PR is merged manually.
-4. The next monthly republish (or a manual `workflow_dispatch` run) will
+4. The founder's `workflow_dispatch` run with `proposal_sha256` (never the cron) will
    produce `v<N+1>` with your record included, signed by the bootstrap key.
 
 This is intentionally low-throughput — the v1 allowlist is targeted at <100
@@ -137,20 +139,52 @@ issuers. Higher scale requires the federation council (Phase C).
 
 ## Auto-republish cron
 
-`monthly-republish.yml` runs on the 1st of each month at 00:00 UTC. The
-underlying `scripts/republish.mjs` script:
+`monthly-republish.yml` (name kept for history) runs **weekly**, Mondays
+03:17 UTC, plus `workflow_dispatch`. **Merging a PR is never the approval for
+changing who is trusted.** The two actions have different triggers:
 
-- Reads the highest-versioned file under `chain/`.
-- If `now() - issued_at < 30 days` → exits 0 (head still fresh).
-- Otherwise builds `v<N+1>` with the same issuers, new `issued_at` /
-  `valid_until`, bumped version, and `previous_sha256` linking back.
-- **In dry-run mode (default)**: prints what it would do; exits 0.
-- **In production mode** (`REPUBLISH_ENABLED=1` + `SIGNING_KEY_BASE64` set):
-  signs, writes the new file, commits + pushes, triggers
-  `verify.dekimu.com` rebuild.
+| Action | What it signs | Cron | `workflow_dispatch` |
+|---|---|---|---|
+| `renew` | the validly-signed head **as is** (same issuer set), next `version`, fresh `issued_at` / `valid_until`, `previous_sha256` → head | yes, when < 14 d of the 30 d validity remain | yes (leave `proposal_sha256` empty) |
+| `sign-proposal` | an unsigned or edited head (any issuer-set change: monitor revocation, issuer addition) — exactly the issuer set parsed from the committed bytes, chained to the last signed doc | **no** — red, "content change awaits founder dispatch", signs nothing | only with `proposal_sha256` = sha256 (hex) of that file as committed; a mismatch is red and signs nothing |
 
-The two secrets are provisioned in the **Phase B6 founder ceremony**. Until
-then every scheduled run is a no-op.
+The dispatch naming the hash **is** the approval:
+
+```sh
+sha256sum chain/dekimu-trusted-issuers.vNN.<issued_at>.json   # on an up-to-date main
+gh workflow run monthly-republish.yml -R dekimuhq/anchors-trusted-issuers-chain -f proposal_sha256=<hex>
+```
+
+(UNVERIFIED end to end: only this repo's Actions can read the real seed. The
+script path is covered by `scripts/test-republish.mjs` with a throwaway key.)
+
+Further guarantees:
+- The script refuses a `SIGNING_KEY_BASE64` whose public key is not the doc's
+  `publisher_key` (rotation is a founder ceremony, never a cron), and refuses
+  if the issuer set of the signed output differs from its approved source.
+- It writes the new file **and `chain/head.json`** (byte copy of the newest
+  signed doc). The workflow stages only those paths (plus the deleted proposal
+  file) and fails if anything else changed, so the commit/PR path cannot alter
+  the issuer set. It then opens one `republish/vNN` PR; merging publishes it.
+  Editing that PR's branch before merge just turns the head into an unsigned
+  proposal again — it never yields a trusted list.
+- An action that is due but cannot be produced exits 2 (red): no signing key,
+  a proposal on cron, a wrong or missing `proposal_sha256`, or the
+  `REPUBLISH_DISABLED=1` repo-variable kill switch. It is never a silent
+  dry-run.
+- While an unsigned proposal sits on `main`, renewals stop too (the cron stays
+  red), so a pending proposal must be dispatched or reverted before the signed
+  head runs out.
+
+`verify.dekimu.com/.well-known/dekimu-trusted-issuers.json` serves
+`chain/head.json` from `main` (1 h cache), but only if it verifies under the
+pinned publisher key; otherwise it serves its vendored floor copy.
+
+History: until 2026-10-19 the job ran on the 1st of the month and skipped heads
+younger than 30 days, even though each doc is valid for exactly 30 days, so a
+mid-month doc always sat expired for weeks. It also stayed dry-run, because
+`REPUBLISH_ENABLED` was never provisioned. v01 expired on 2026-08-16 while the
+monthly runs kept passing green.
 
 ---
 
@@ -166,7 +200,8 @@ list:
 4. Either check fails → increment per-issuer failure counter.
 5. Counter ≥ 3 (three consecutive days) → open a draft PR setting
    `revoked_at: <now>` on that issuer with reason `"domain_unreachable"`.
-   Founder approves the revocation manually.
+   Founder merges, then dispatches the republish with the file's
+   `proposal_sha256`. The merge alone revokes nothing.
 
 The monitor cannot revoke unilaterally — it can only nominate.
 

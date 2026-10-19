@@ -1,36 +1,116 @@
 name: Monthly republish
 
-# Re-signs the head of the trusted-issuers chain every 30 days even if no
-# governance change has occurred. Keeps freshness markers honest so consumers
-# (default verifier `valid_until` window) don't drift into staleness during
-# quiet months.
+# Keeps the head of the trusted-issuers chain inside its validity window.
+# (File name kept for history; the check runs WEEKLY since 2026-10-19.)
 #
-# DRY-RUN UNTIL PHASE B6. The script no-ops unless BOTH the
-# `REPUBLISH_ENABLED=1` and `SIGNING_KEY_BASE64` secrets are set. The
-# founder-ceremony in Phase B6 provisions those secrets.
+# GOVERNANCE: merging a PR in this public repo never changes who is trusted.
+#   renew          (same issuer set as the signed head, fresh window, next
+#                  version) — weekly cron OR workflow_dispatch.
+#   sign-proposal  (unsigned/edited head = any issuer-set change) — ONLY
+#                  workflow_dispatch with input proposal_sha256 = sha256 of
+#                  the proposal file as committed. The dispatch is the
+#                  approval. On cron the job goes red ("content change awaits
+#                  founder dispatch") and signs nothing.
+# The commit/PR step stages only the files the script reported and refuses
+# any other change, so this path cannot alter the issuer set itself.
+#
+# Every doc is valid 30 days; renewal fires when < 14 days remain, giving two
+# weekly attempts and >= 7 days to merge the renewal PR. (History: the old
+# monthly cron + 30-day skip + never-set REPUBLISH_ENABLED gate let v01
+# expire 2026-08-16 behind green dry-runs.)
+#
+# Red (exit 2) whenever an action is due but refused or impossible: missing
+# SIGNING_KEY_BASE64, REPUBLISH_DISABLED=1 kill switch (repo variable), a
+# proposal on cron, or a proposal_sha256 that does not match.
 
 on:
   schedule:
-    - cron: "0 0 1 * *"  # 1st of each month, 00:00 UTC
+    - cron: "17 3 * * 1"  # Mondays 03:17 UTC
   workflow_dispatch:
+    inputs:
+      proposal_sha256:
+        description: "sha256 (hex) of the committed unsigned proposal file to sign. Leave empty for a plain renew."
+        required: false
+        default: ""
 
 permissions:
   contents: read
+
+concurrency:
+  group: republish
+  cancel-in-progress: false
 
 jobs:
   republish:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
-      - name: Run republish (dry-run unless REPUBLISH_ENABLED=1)
+      - name: Self-tests (JCS + planner/signer + committed chain)
+        run: |
+          node scripts/test-canonical.mjs
+          node scripts/test-republish.mjs
+
+      - name: Skip if a republish PR is already open
+        id: dupe
         env:
-          REPUBLISH_ENABLED: ${{ secrets.REPUBLISH_ENABLED }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OPEN=$(gh pr list --state open --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("republish/"))] | length')
+          echo "open=${OPEN}" >> "$GITHUB_OUTPUT"
+          if [ "$OPEN" != "0" ]; then
+            echo "::notice::a republish PR is already open — merge it; not opening another."
+          fi
+
+      - name: Re-sign head if due
+        id: republish
+        if: steps.dupe.outputs.open == '0'
+        env:
+          TRIGGER: ${{ github.event_name }}
+          PROPOSAL_SHA256: ${{ inputs.proposal_sha256 || '' }}
+          REPUBLISH_DISABLED: ${{ vars.REPUBLISH_DISABLED || '0' }}
           SIGNING_KEY_BASE64: ${{ secrets.SIGNING_KEY_BASE64 }}
         run: node scripts/republish.mjs
-      - name: Validate JCS round-trip
-        run: node scripts/test-canonical.mjs
+
+      - name: Re-run self-tests over the new chain
+        if: steps.republish.outputs.wrote != ''
+        run: node scripts/test-republish.mjs
+
+      - name: Open republish PR
+        if: steps.republish.outputs.wrote != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FILE: ${{ steps.republish.outputs.wrote }}
+          VERSION: ${{ steps.republish.outputs.version }}
+          ACTION: ${{ steps.republish.outputs.action }}
+          DELETED: ${{ steps.republish.outputs.deleted }}
+        run: |
+          set -euo pipefail
+          BRANCH="republish/v${VERSION}"
+          git config user.name "dekimu-bot"
+          git config user.email "ops@dekimu.com"
+          git checkout -b "$BRANCH"
+          git add "chain/${FILE}" chain/head.json
+          if [ -n "${DELETED}" ]; then git rm -q --cached "chain/${DELETED}"; fi
+          # Refuse anything beyond exactly what the script reported: the PR can
+          # only carry the bytes the script signed.
+          EXPECTED=$(printf '%s\n' "A chain/${FILE}" "M chain/head.json" ${DELETED:+"D chain/${DELETED}"} | sort)
+          ACTUAL=$(git diff --cached --name-status | awk '{print $1" "$2}' | sort)
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::staged changes differ from what republish reported"; echo "$ACTUAL"; exit 1
+          fi
+          if [ -n "$(git status --porcelain --untracked-files=all | grep -v '^D  \|^A  \|^M  ' || true)" ]; then
+            echo "::error::unexpected working-tree changes"; git status --porcelain; exit 1
+          fi
+          TITLE="republish (${ACTION}): v${VERSION} (${FILE})"
+          BODY="Automated re-sign from the republish workflow (run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}). New head chained via previous_sha256 to the previous signed doc; signature self-verified and the full committed chain re-checked by scripts/test-republish.mjs before this PR opened. Merging publishes it: verify.dekimu.com/.well-known/dekimu-trusted-issuers.json serves chain/head.json from main."
+          git commit -m "$TITLE"
+          git push origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$BODY"
