@@ -7,8 +7,11 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalize } from "./lib/canonical.mjs";
+import { mkdtempSync, mkdirSync, cpSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import {
-  plan, buildNext, sigValid, sha256OfCanonical, publisherKeyOf, base64UrlEncode, loadChain,
+  plan, buildNext, sigValid, sha256OfCanonical, publisherKeyOf, base64UrlEncode, loadChain, authorize, sha256Hex,
   VALIDITY_MS, RENEW_MARGIN_MS,
 } from "./republish.mjs";
 
@@ -62,6 +65,68 @@ const { privateKey: other } = crypto.generateKeyPairSync("ed25519");
 let threw = false;
 try { buildNext({ base: genesis, prev: genesis, now: late, privateKey: other }); } catch { threw = true; }
 check("wrong signing key refused", threw);
+
+// ---- trigger gate (pure) ----
+const renewPlan = plan([e(genesis)], late);
+check("cron may renew", authorize(renewPlan, { trigger: "schedule" }).ok);
+check("dispatch may renew", authorize(renewPlan, { trigger: "workflow_dispatch" }).ok);
+check("renew + stray proposal_sha256 → refused", !authorize(renewPlan, { trigger: "workflow_dispatch", proposalSha: "ab" }).ok);
+const propPlan = { ...pp, proposalSha256: "a".repeat(64) };
+const cronProp = authorize(propPlan, { trigger: "schedule" });
+check("cron + proposal → red, 'content change awaits founder dispatch'", !cronProp.ok && cronProp.code === 2 && /content change awaits founder dispatch/.test(cronProp.reason));
+check("unset trigger treated as cron", !authorize(propPlan, {}).ok);
+check("dispatch + proposal, no hash → red", !authorize(propPlan, { trigger: "workflow_dispatch" }).ok);
+check("dispatch + wrong hash → red", !authorize(propPlan, { trigger: "workflow_dispatch", proposalSha: "b".repeat(64) }).ok);
+check("dispatch + right hash (case-insensitive) → ok", authorize(propPlan, { trigger: "workflow_dispatch", proposalSha: "A".repeat(64) }).ok);
+
+// ---- end-to-end: the real script in a throwaway repo copy ----
+const here = path.dirname(fileURLToPath(import.meta.url));
+const seedB64 = privateKey.export({ format: "der", type: "pkcs8" }).subarray(-32).toString("base64");
+function sandbox() {
+  const dir = mkdtempSync(path.join(tmpdir(), "republish-e2e-"));
+  cpSync(here, path.join(dir, "scripts"), { recursive: true });
+  mkdirSync(path.join(dir, "chain"));
+  const fresh = new Date();
+  const g = signDoc({ ...genesis, issued_at: new Date(fresh.getTime() - DAY).toISOString(), valid_until: new Date(fresh.getTime() + 29 * DAY).toISOString() });
+  writeFileSync(path.join(dir, "chain", e(g).file), JSON.stringify(g, null, 2) + "\n");
+  writeFileSync(path.join(dir, "chain", "head.json"), JSON.stringify(g, null, 2) + "\n");
+  const prop = { ...g, version: 2, issued_at: fresh.toISOString(), issuers: [{ ...g.issuers[0], revoked_at: fresh.toISOString() }], previous_sha256: null, sig: null };
+  const propFile = e(prop).file;
+  const propBytes = Buffer.from(JSON.stringify(prop, null, 2) + "\n");
+  writeFileSync(path.join(dir, "chain", propFile), propBytes);
+  return { dir, g, propFile, propSha: sha256Hex(propBytes) };
+}
+function run(dir, env) {
+  return spawnSync(process.execPath, [path.join(dir, "scripts", "republish.mjs")], {
+    env: { PATH: process.env.PATH, SIGNING_KEY_BASE64: seedB64, ...env }, encoding: "utf8",
+  });
+}
+const files = (dir) => readdirSync(path.join(dir, "chain")).sort().join(",");
+{
+  const sb = sandbox(); const before = files(sb.dir);
+  const r = run(sb.dir, { TRIGGER: "schedule" });
+  check("e2e cron + proposal → exit 2, says awaits founder dispatch", r.status === 2 && /content change awaits founder dispatch/.test(r.stdout));
+  check("e2e cron + proposal → nothing written", files(sb.dir) === before);
+}
+{
+  const sb = sandbox(); const before = files(sb.dir);
+  const r = run(sb.dir, { TRIGGER: "workflow_dispatch", PROPOSAL_SHA256: "0".repeat(64) });
+  check("e2e dispatch + wrong hash → exit 2, nothing written", r.status === 2 && files(sb.dir) === before);
+}
+{
+  const sb = sandbox();
+  const r = run(sb.dir, { TRIGGER: "workflow_dispatch", PROPOSAL_SHA256: sb.propSha, REPUBLISH_DISABLED: "1" });
+  check("e2e right hash but kill switch → exit 2", r.status === 2);
+}
+{
+  const sb = sandbox();
+  const r = run(sb.dir, { TRIGGER: "workflow_dispatch", PROPOSAL_SHA256: sb.propSha });
+  const after = await loadChain(path.join(sb.dir, "chain"));
+  const head = JSON.parse(readFileSync(path.join(sb.dir, "chain", "head.json"), "utf8"));
+  check("e2e dispatch + right hash → exit 0, signs v2", r.status === 0 && after.length === 2 && after[1].doc.version === 2 && sigValid(after[1].doc));
+  check("e2e signed v2 chains to v1 and carries exactly the proposal's issuers", after[1].doc.previous_sha256 === sha256OfCanonical(after[0].doc) && after[1].doc.issuers[0].revoked_at !== null && after[1].doc.issuers.length === 1);
+  check("e2e proposal file removed, head.json = v2", !files(sb.dir).includes(sb.propFile) && JSON.stringify(head) === JSON.stringify(after[1].doc));
+}
 
 // the real committed chain must verify under its own publisher_key. A merged
 // governance proposal (unsigned head, e.g. a monitor revocation) is tolerated —

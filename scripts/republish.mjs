@@ -1,39 +1,42 @@
 #!/usr/bin/env node
 /**
- * Re-sign the head of the trusted-issuers chain before it expires.
+ * Re-sign the head of the trusted-issuers chain.
  *
- * Invoked by `.github/workflows/monthly-republish.yml` (weekly check). The
- * workflow — not this script — branches, commits and opens the PR.
+ * Invoked by `.github/workflows/monthly-republish.yml`. The workflow — not
+ * this script — branches, commits and opens the PR.
  *
- * Why weekly + a renewal margin (2026-10-19): the old monthly cron skipped a
- * head younger than 30 days while every doc is only valid for 30 days, so a
- * doc issued mid-month was guaranteed to sit expired for up to a month. v01
- * (issued 2026-07-17, valid_until 2026-08-16) expired that way — and then the
- * job stayed dry-run because `REPUBLISH_ENABLED` was never provisioned at the
- * B6 ceremony, printing a green "would build v02" every month.
+ * GOVERNANCE (2026-10-19): a merged PR in this PUBLIC repo is never the
+ * approval for changing who is trusted. Two actions, two triggers:
  *
- * Logic:
- *   1. Read every `chain/dekimu-trusted-issuers.vNN.*.json`.
- *   2. `lastSigned` = highest-version doc whose `sig` verifies under its own
- *      `publisher_key`. `head` = highest-version doc overall.
- *   3. head unsigned / sig invalid → it is a merged governance proposal (the
- *      daily monitor writes revocations with `sig: null`; issuer additions are
- *      PR edits). Sign it as `lastSigned.version + 1`, chained to `lastSigned`,
- *      and delete the proposal file.
- *   4. head signed and `valid_until - now >= RENEW_MARGIN_MS` → fresh, exit 0.
- *   5. Otherwise build `head.version + 1` with a fresh 30-day window.
- *   6. Signing key = `SIGNING_KEY_BASE64` (raw 32-byte Ed25519 seed). Its
- *      public key MUST equal the doc's `publisher_key`, else refuse.
- *   7. Write the new file + `chain/head.json` (byte copy of the newest signed
- *      doc — the stable path verify.dekimu.com fetches), print
- *      `wrote=<filename>` to $GITHUB_OUTPUT.
+ *   renew          head is validly signed and needs a fresh window. The new
+ *                  doc is built FROM THE SIGNED HEAD ITSELF — same issuer set,
+ *                  next version, fresh issued_at/valid_until. Allowed from the
+ *                  weekly cron and from workflow_dispatch.
+ *   sign-proposal  head is unsigned or its sig does not verify (a merged
+ *                  monitor revocation, an issuer addition, any edit). Allowed
+ *                  ONLY from workflow_dispatch with `PROPOSAL_SHA256` equal to
+ *                  the sha256 (hex) of the proposal file's committed bytes.
+ *                  The founder's dispatch naming that hash IS the approval;
+ *                  the script signs exactly the issuer set parsed from those
+ *                  bytes. On cron it goes red ("content change awaits founder
+ *                  dispatch") and signs nothing.
  *
- * Exit codes: 0 = fresh or wrote a doc · 1 = error · 2 = a renewal was due but
- * could not be produced (no key / kill switch) — red on purpose, because a
- * silent dry-run is exactly how v01 expired unnoticed.
+ * Why weekly + a renewal margin: the old monthly cron skipped heads younger
+ * than 30 days while every doc is valid for 30 days, so v01 (issued
+ * 2026-07-17) expired 2026-08-16 — behind a dry-run gate that was never
+ * opened, printing green every month.
  *
- * Kill switch: `REPUBLISH_DISABLED=1` (repo variable) → no write, exit 2 when
- * a renewal was due.
+ * Env: TRIGGER (`schedule` | `workflow_dispatch`, from github.event_name;
+ * unset = schedule, the conservative reading) · PROPOSAL_SHA256 ·
+ * SIGNING_KEY_BASE64 (raw 32-byte Ed25519 seed; its pubkey MUST equal
+ * publisher_key) · REPUBLISH_DISABLED=1 kill switch.
+ *
+ * Writes the new doc + `chain/head.json` (byte copy — the path
+ * verify.dekimu.com serves) and deletes the signed proposal file; prints
+ * `wrote=` / `version=` / `deleted=` to $GITHUB_OUTPUT.
+ *
+ * Exit: 0 = nothing due, or wrote a doc · 1 = error · 2 = action due but
+ * refused or impossible (red on purpose — a silent dry-run is how v01 died).
  */
 
 import { readdir, readFile, writeFile, unlink, appendFile } from "node:fs/promises";
@@ -58,6 +61,35 @@ export function base64UrlEncode(bytes) {
 
 export function sha256OfCanonical(doc) {
   return `sha256:${crypto.createHash("sha256").update(canonicalize(doc)).digest("hex")}`;
+}
+
+export function sha256Hex(bytes) {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
+/**
+ * Trigger gate. `p` = plan(); returns { ok: true } or { ok: false, code, reason }.
+ * `proposalSha` = the founder-supplied hash; `p.proposalSha256` = the committed bytes' hash.
+ */
+export function authorize(p, { trigger, proposalSha }) {
+  const isDispatch = trigger === "workflow_dispatch";
+  const named = (proposalSha ?? "").trim().toLowerCase();
+  if (p.action === "sign-proposal") {
+    if (!isDispatch) {
+      return { ok: false, code: 2, reason: `content change awaits founder dispatch: ${p.proposalFile} (sha256 ${p.proposalSha256}) — run with -f proposal_sha256=<hex>` };
+    }
+    if (named === "") {
+      return { ok: false, code: 2, reason: `proposal ${p.proposalFile} needs proposal_sha256 (committed bytes: ${p.proposalSha256})` };
+    }
+    if (named !== p.proposalSha256) {
+      return { ok: false, code: 2, reason: `proposal_sha256 ${named} does not match ${p.proposalFile} as committed (${p.proposalSha256}) — signing nothing` };
+    }
+    return { ok: true };
+  }
+  if (named !== "") {
+    return { ok: false, code: 2, reason: `proposal_sha256 given but there is no unsigned proposal to sign (plan: ${p.action}) — signing nothing` };
+  }
+  return { ok: true };
 }
 
 export function signerFromSeedB64(b64) {
@@ -102,6 +134,7 @@ export function plan(entries, now) {
       base: head.doc,
       prev: lastSigned.doc,
       proposalFile: head.file,
+      proposalSha256: head.sha256,
       reason: `head ${head.file} is unsigned or its sig does not verify — signing it as v${lastSigned.doc.version + 1}`,
     };
   }
@@ -135,6 +168,7 @@ export function buildNext({ base, prev, now, privateKey }) {
   };
   const sig = crypto.sign(null, Buffer.from(canonicalize(unsigned)), privateKey);
   const signed = { ...unsigned, sig: base64UrlEncode(sig) };
+  if (canonicalize(signed.issuers) !== canonicalize(base.issuers)) throw new Error("issuer set changed while signing — refusing");
   if (!sigValid(signed)) throw new Error("self-verify of the new doc failed");
   return signed;
 }
@@ -155,7 +189,8 @@ export async function loadChain(chainDir) {
   for (const file of names) {
     const m = file.match(FILE_RE);
     if (!m) continue;
-    entries.push({ file, version: Number.parseInt(m[1], 10), doc: JSON.parse(await readFile(path.join(chainDir, file), "utf8")) });
+    const bytes = await readFile(path.join(chainDir, file));
+    entries.push({ file, version: Number.parseInt(m[1], 10), sha256: sha256Hex(bytes), doc: JSON.parse(bytes.toString("utf8")) });
   }
   return entries.sort((a, b) => a.version - b.version);
 }
@@ -173,6 +208,12 @@ async function main() {
   if (p.action === "error") {
     process.stderr.write(`[republish] ERROR: ${p.reason}\n`);
     return 1;
+  }
+
+  const auth = authorize(p, { trigger: process.env.TRIGGER ?? "schedule", proposalSha: process.env.PROPOSAL_SHA256 });
+  if (!auth.ok) {
+    process.stdout.write(`::error::${auth.reason}\n`);
+    return auth.code;
   }
 
   if (process.env.REPUBLISH_DISABLED === "1") {
@@ -193,7 +234,8 @@ async function main() {
   if (p.action === "sign-proposal") await unlink(path.join(chainDir, p.proposalFile));
   log(`wrote ${nextFile} (previous_sha256 ${next.previous_sha256}) + head.json`);
   if (process.env.GITHUB_OUTPUT) {
-    await appendFile(process.env.GITHUB_OUTPUT, `wrote=${nextFile}\nversion=${next.version}\n`);
+    const deleted = p.action === "sign-proposal" ? p.proposalFile : "";
+    await appendFile(process.env.GITHUB_OUTPUT, `wrote=${nextFile}\nversion=${next.version}\naction=${p.action}\ndeleted=${deleted}\n`);
   }
   return 0;
 }
