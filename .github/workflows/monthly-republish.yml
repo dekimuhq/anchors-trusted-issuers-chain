@@ -113,4 +113,19 @@ jobs:
           BODY="Automated re-sign from the republish workflow (run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}). New head chained via previous_sha256 to the previous signed doc; signature self-verified and the full committed chain re-checked by scripts/test-republish.mjs before this PR opened. Merging publishes it: verify.dekimu.com/.well-known/dekimu-trusted-issuers.json serves chain/head.json from main."
           git commit -m "$TITLE"
           git push origin "$BRANCH"
-          gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$BODY"
+          # The org and this repo keep "Allow GitHub Actions to create and approve
+          # pull requests" OFF on purpose. Then the branch is pushed and only the PR
+          # step is refused: that is not a failed renewal — the PR is opened by
+          # Dekimu's trusted-issuers-renew-pr workflow, or by hand. Any other
+          # failure here stays red.
+          if OUT=$(gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$BODY" 2>&1); then
+            echo "$OUT"
+          else
+            echo "$OUT"
+            case "$OUT" in
+              *"not permitted to create"*)
+                echo "::notice::branch ${BRANCH} pushed; PR will be opened by the monorepo lane trusted-issuers-renew-pr (or by hand: gh pr create -R dekimuhq/anchors-trusted-issuers-chain --head ${BRANCH} --base main)"
+                exit 0 ;;
+            esac
+            exit 1
+          fi
