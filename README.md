@@ -166,6 +166,7 @@ Further guarantees:
   signed doc). The workflow stages only those paths (plus the deleted proposal
   file) and fails if anything else changed, so the commit/PR path cannot alter
   the issuer set. It then opens one `republish/vNN` PR; merging publishes it.
+  If this repo's Actions may not open PRs (an org/repo setting), the run pushes the branch, notes it, and the PR is opened by Dekimu's `trusted-issuers-renew-pr` workflow or by hand: `gh pr create -R dekimuhq/anchors-trusted-issuers-chain --head republish/vNN --base main`.
   Editing that PR's branch before merge just turns the head into an unsigned
   proposal again — it never yields a trusted list.
 - An action that is due but cannot be produced exits 2 (red): no signing key,
